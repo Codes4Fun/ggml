@@ -84,42 +84,49 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
 }
 
 template<ggml_sort_order order>
-static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
+static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad, int nblocks) {
     // bitonic sort
-    int col = threadIdx.x;
+    int col_start = threadIdx.x;
+    int col_end = col_start + nblocks * 1024;
+    if (col_end > ncols_pad) col_end = ncols_pad;
     int row = blockIdx.x;
 
-    if (col >= ncols_pad) {
+    if (col_start >= ncols_pad) {
         return;
     }
 
-    const float * x_row = x + row * ncols;
     extern __shared__ int dst_row[];
 
     // initialize indices
-    dst_row[col] = col;
+    for (int col = col_start; col < col_end; col += 1024) {
+        dst_row[col] = col;
+    }
 
     __syncthreads();
 
+    const float * x_row = x + row * ncols;
+
     for (int k = 2; k <= ncols_pad; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
-            int ixj = col ^ j;
-            if (ixj > col) {
-                if ((col & k) == 0) {
-                    if (dst_row[col] >= ncols ||
-                        (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                            x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] < x_row[dst_row[ixj]]))
-                    ) {
-                        ggml_cuda_swap(dst_row[col], dst_row[ixj]);
-                    }
-                } else {
-                    if (dst_row[ixj] >= ncols ||
-                        (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
-                            x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] > x_row[dst_row[ixj]]))
-                    ) {
-                        ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+            for (int col = col_start; col < col_end; col += 1024) {
+                int ixj = col ^ j;
+                if (ixj > col) {
+                    if ((col & k) == 0) {
+                        if (dst_row[col] >= ncols ||
+                            (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
+                                x_row[dst_row[col]] > x_row[dst_row[ixj]] :
+                                x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                        ) {
+                            ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+                        }
+                    } else {
+                        if (dst_row[ixj] >= ncols ||
+                            (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
+                                x_row[dst_row[col]] < x_row[dst_row[ixj]] :
+                                x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                        ) {
+                            ggml_cuda_swap(dst_row[col], dst_row[ixj]);
+                        }
                     }
                 }
             }
@@ -128,7 +135,7 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
     }
 
     // copy the result to dst without the padding
-    if (col < ncols) {
+    for (int col = col_start; col < ncols; col += 1024) {
         dst[row * ncols + col] = dst_row[col];
     }
 }
@@ -149,8 +156,16 @@ static void argsort_f32_i32_cuda_bitonic(const float *   x,
                                          cudaStream_t    stream) {
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
+    int nblocks, nthreads;
+    if (ncols_pad > 1024) {
+        nthreads = 1024;
+        nblocks = ncols_pad / 1024;
+    } else {
+        nthreads = ncols_pad;
+        nblocks = 1;
+    }
 
-    const dim3 block_dims(ncols_pad, 1, 1);
+    const dim3 block_dims(nthreads, 1, 1);
     const dim3 block_nums(nrows, 1, 1);
     const size_t shared_mem = ncols_pad * sizeof(int);
 
@@ -159,10 +174,10 @@ static void argsort_f32_i32_cuda_bitonic(const float *   x,
 
     if (order == GGML_SORT_ORDER_ASC) {
         k_argsort_f32_i32<GGML_SORT_ORDER_ASC>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, nblocks);
     } else if (order == GGML_SORT_ORDER_DESC) {
         k_argsort_f32_i32<GGML_SORT_ORDER_DESC>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad, nblocks);
     } else {
         GGML_ABORT("fatal error");
     }
